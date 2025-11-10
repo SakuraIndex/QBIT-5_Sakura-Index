@@ -1,0 +1,27 @@
+name: QBIT-5 Auto Scheduler
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'    # 30分ごと
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check freshness
+        run: |
+          if [ -f docs/outputs/last_run.txt ]; then
+            ts=$(date -u -d "$(cat docs/outputs/last_run.txt)" +%s || true)
+            now=$(date -u +%s)
+            diff=$(( (now - ts) / 60 ))
+            echo "diff minutes: $diff"
+            if [ "$diff" -gt "720" ]; then
+              echo "STALE (>12h)."
+              exit 1
+            fi
+          fi
