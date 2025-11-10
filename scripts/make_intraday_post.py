@@ -1,163 +1,62 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# scripts/make_intraday_post.py
+import json
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+import math
 
-"""
-QBIT-5 intraday chart (equal-weight) for *today's US session*.
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "docs" / "outputs"
+STATS = OUT / "qbit_5_stats.json"
 
-- その場で各構成銘柄の 1 分足を yfinance から取得
-- 当日（US/Eastern）のデータだけを抽出
-- 銘柄ごとの当日始値比を計算 → 等加重平均 → % 表示
-- ダークテーマで高DPI描画（サイトと同配色）
-- 上昇=ティール、下落=サーモンの自動色分け
+def jst_now_str():
+    jst = timezone(timedelta(hours=9))
+    return datetime.now(jst).strftime("%Y/%m/%d %H:%M (JST)")
 
-Input  : なし（ネットから minute データ取得）
-Output : docs/outputs/qbit_5_intraday.png
-"""
+def fmt_pct(x: float) -> str:
+    # 表示は小数点2桁、符号付き
+    sign = "+" if x >= 0 else ""
+    return f"{sign}{x:.2f}%"
 
-import os
-from datetime import datetime, timedelta, timezone
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-
-import yfinance as yf
-import pytz
-
-# ---- config ---------------------------------------------------------------
-TICKERS = ["IONQ", "QBTS", "RGTI", "ARQQ", "QUBT"]
-BASE_DIR = "docs/outputs"
-OUT_PNG = os.path.join(BASE_DIR, "qbit_5_intraday.png")
-
-# dark theme (site palette)
-BG      = "#0b1420"
-BORDER  = "#1c2a3a"
-TEXT    = "#d4e9f7"
-SUBTEXT = "#9fb6c7"
-UP      = "#22d3ee"
-DOWN    = "#fb7185"
-ZERO    = "#334155"
-
-US_EAST = pytz.timezone("US/Eastern")
-JST     = timezone(timedelta(hours=9))
-
-
-# ---- helpers --------------------------------------------------------------
-def _today_eastern_now():
-    """US/Eastern の今日の日付オブジェクトを返す"""
-    return datetime.now(tz=US_EAST).date()
-
-def _load_1min_last_session(ticker: str) -> pd.Series:
-    """
-    指定ティッカーの 1分足 Close を取得し、
-    US/Eastern の「直近の営業日」のデータだけを返す (Series[Datetime->float]).
-    """
-    # 2日分取って、直近営業日を切り出す（場中・場後どちらでも対応）
-    df = yf.download(
-        ticker, period="2d", interval="1m", auto_adjust=True,
-        progress=False, prepost=False, threads=True
-    )
-    if df.empty:
-        raise RuntimeError(f"empty minute data: {ticker}")
-
-    # yfinance の index は tz-naive(UTC) or tz-aware(UTC) のことがある。UTC とみなし Eastern へ。
-    idx_utc = pd.to_datetime(df.index, utc=True)
-    idx_est = idx_utc.tz_convert(US_EAST)
-    df = df.set_index(idx_est)
-    df = df.sort_index()
-
-    # 直近の営業日を求める（最終レコードの日付）
-    last_est_day = df.index[-1].date()
-
-    # 同日のみ抽出 & RTH(正規時間) でフィルタ（9:30–16:00）
-    s = df["Close"].copy()
-    s = s[s.index.date == last_est_day]
-    s = s.between_time("09:30", "16:00")
-    s.name = ticker
-    return s.dropna()
-
-
-def _compose_equal_weight(panels: list[pd.Series]) -> pd.DataFrame:
-    """
-    複数ティッカーの Series を時間で内部結合。等加重で合成し、
-    当日始値比％の DataFrame を返す。
-    """
-    if not panels:
-        raise RuntimeError("no panels")
-    df = pd.concat(panels, axis=1, join="inner").sort_index()
-    # 当日始値（その日の最初の値）で正規化
-    opens = df.iloc[0]
-    rel = df / opens  # 各列が 1.00 から始まる比率
-    eqw = rel.mean(axis=1)
-    pct = (eqw - 1.0) * 100.0
-    # 見やすさのため 3点移動平均（形状は保持）
-    pct_sm = pct.rolling(window=3, min_periods=1, center=True).mean()
-    out = pd.DataFrame({"pct": pct_sm})
-    return out
-
-
-def _style_axes(ax):
-    ax.set_facecolor(BG)
-    for sp in ax.spines.values():
-        sp.set_color(BORDER)
-        sp.set_linewidth(1.0)
-    ax.tick_params(colors=TEXT, labelsize=10)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(decimals=1))
-    ax.grid(True, which="major", color="#1f2b3a", alpha=0.55, linewidth=0.6)
-    ax.grid(True, which="minor", color="#1f2b3a", alpha=0.35, linewidth=0.4)
-    ax.minorticks_on()
-
-
-# ---- main ----------------------------------------------------------------
 def main():
-    # 1) 各銘柄の 1 分足を取得
-    panels = []
-    for t in TICKERS:
-        try:
-            panels.append(_load_1min_last_session(t))
-        except Exception as e:
-            print(f"[warn] {t}: {e}")
-    if len(panels) < 2:
-        raise RuntimeError("failed to fetch minute data enough for composition")
+    if not STATS.exists():
+        raise FileNotFoundError(f"stats not found: {STATS}")
 
-    # 2) 等加重インデックス（当日始値比％）
-    intraday = _compose_equal_weight(panels)
-    last_pct = float(intraday["pct"].iloc[-1])
-    color = UP if last_pct >= 0 else DOWN
+    data = json.loads(STATS.read_text(encoding="utf-8"))
 
-    # 3) 描画
-    plt.rcParams["figure.facecolor"] = BG
-    fig, ax = plt.subplots(figsize=(16, 9), dpi=200)
-    _style_axes(ax)
+    # 互換フィールド名：pct_intraday / rtn_intraday など
+    pct = None
+    for k in ["pct_intraday", "intraday_pct", "change_pct", "pct", "rtn_pct"]:
+        v = data.get(k)
+        if isinstance(v, (int, float)):
+            pct = float(v)
+            break
+    if pct is None:
+        raise RuntimeError("pct_intraday missing in stats")
 
-    # 0%ライン
-    ax.axhline(0, color=ZERO, linewidth=1.1, alpha=0.9, zorder=1)
+    tickers = data.get("tickers", [])
+    tickers_str = ",".join(tickers) if tickers else "IONQ,QBTS,RGTI,ARQQ,QUBT"
 
-    # ライン
-    ax.plot(
-        intraday.index, intraday["pct"],
-        color=color, linewidth=2.2, solid_capstyle="round", antialiased=True, zorder=3
-    )
-    ax.fill_between(intraday.index, intraday["pct"], 0, color=color, alpha=0.08, zorder=2)
+    # 見出し・本文
+    title = "【QBIT-5｜量子コンピューター指数】"
+    line1 = f"本日: {fmt_pct(pct)}"
+    last_level = data.get("last_level")
+    line2 = f"指数: {last_level:.2f}" if isinstance(last_level, (int, float)) else ""
+    line3 = f"構成: {tickers_str}"
+    ts = data.get("updated_at") or jst_now_str()
+    footer = f"更新: {ts}"
+    hashtags = "#桜Index #QBIT5"
 
-    # x 軸を時間だけに（Eastern → JST をタイトルに付記）
-    ax.set_xlabel("", color=SUBTEXT)
-    ax.set_ylabel("Change vs Open (%)", color=SUBTEXT)
-    # 目盛りを 30分刻み程度に
-    ax.xaxis.set_major_locator(mticker.MaxNLocator(7))
-    ax.tick_params(axis="x", rotation=0)
+    body = "\n".join([title, line1, line2, line3, hashtags])
 
-    ts_jst = intraday.index[-1].tz_convert(JST)
-    ax.set_title(
-        f"QBIT-5 Intraday Snapshot ({ts_jst:%Y/%m/%d %H:%M JST})",
-        color=TEXT, fontsize=14, pad=10, weight="bold"
-    )
+    # 2 か所に同一内容を書き出す（サイト側は post_intraday.txt を見に行く場合があるため）
+    targets = [
+        OUT / "qbit_5_post_intraday.txt",
+        OUT / "post_intraday.txt",
+    ]
+    for p in targets:
+        p.write_text(body, encoding="utf-8")
 
-    plt.tight_layout()
-    os.makedirs(BASE_DIR, exist_ok=True)
-    fig.savefig(OUT_PNG, facecolor=BG, bbox_inches="tight")
-    plt.close(fig)
-    print(f"saved: {OUT_PNG} last={last_pct:+.2f}%")
+    print("written:", ", ".join(str(p) for p in targets))
 
 if __name__ == "__main__":
     main()
