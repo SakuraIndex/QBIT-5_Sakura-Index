@@ -2,13 +2,12 @@ name: QBIT-5 Intraday
 
 on:
   schedule:
-    - cron: '30 22 * * 1-5'   # JST 07:30
+    - cron: '30 22 * * 1-5'   # JST 07:30（米株営業日の朝）
   workflow_dispatch:
 
 permissions:
   contents: write
 
-# 同時書き込みを直列化
 concurrency:
   group: qbit5-outputs-write
   cancel-in-progress: false
@@ -21,7 +20,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # リモートと同期（rebase）
       - name: Pre-sync main (rebase first)
         run: |
           git config user.name  "github-actions[bot]"
@@ -40,26 +38,25 @@ jobs:
           python -m pip install -U pip
           pip install -r src/requirements.txt
 
+      # 1) 当日ティックを集計し、intraday系列と stats.json を更新
       - name: Calc snapshot & stats
         run: python src/qbit5_snapshot.py
 
+      # 2) Intraday チャートを描画（黒ベース・当日分のみ）
       - name: Make intraday chart
         run: python scripts/make_intraday_chart.py
 
-      # （任意）X投稿文を生成する場合は片方を有効化
-      # - name: Prepare X post text (optional)
-      #   run: python scripts/make_intraday_post.py
-      # - name: Prepare X post text (optional)
-      #   run: python scripts/qbit5_pct_post.py
+      # 3) X 投稿文（post_intraday.txt / qbit_5_post_intraday.txt）を生成
+      - name: Prepare X post text
+        run: python scripts/make_intraday_post.py
 
-      - name: Commit outputs
-        uses: EndBug/add-and-commit@v9
-        with:
-          add: |
-            docs/outputs/*.png
-            docs/outputs/*.txt
-            docs/outputs/*.json
-            docs/outputs/*.csv
-          message: 'chore(qbit5): intraday snapshot'
-          pull: '--rebase --autostash'
-          push: true
+      # 4) まとめてコミット & push（先行コミットは rebase/autostash で吸収）
+      - name: Commit & push (rebase autostash)
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/outputs/*
+          git commit -m "chore(qbit5): intraday snapshot" || echo "nothing to commit"
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
