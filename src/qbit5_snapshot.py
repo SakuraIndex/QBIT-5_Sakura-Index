@@ -1,145 +1,180 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-QBIT-5 intraday snapshot
-- 統一基準: 当日始値比（Change vs Open, %）
-- 出力:
-  docs/outputs/qbit_5_levels.csv        … 当日分の時系列(level, chg_open_pct)
-  docs/outputs/qbit_5_stats.json        … 最終時点の%など
-  docs/outputs/qbit_5_post_intraday.txt … X投稿用の1行テキスト
-  docs/outputs/last_run.txt             … 心拍（サイトのキャッシュバスター用）
+QBIT-5 snapshot generator (intraday-safe)
+- 直近5営業日の1分足を取り、最新の取引日を自動判定
+- 当日データが無い/薄い場合は前営業日にフォールバック
+- Intraday系列を CSV 出力（scripts/make_intraday_chart.py が使用）
+- stats.json（pct_intraday, updated_at, last_level）を更新
 """
 
-import os, json, io, math, time
+import os
+import sys
+import json
+import math
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-
-# yfinanceはActionsで pip install yfinance==0.2.* 済み想定
+import numpy as np
 import yfinance as yf
 
-ROOT = os.path.dirname(os.path.dirname(__file__))  # repo root
-OUTD = os.path.join(ROOT, "docs", "outputs")
-os.makedirs(OUTD, exist_ok=True)
-
-# ===== 指数定義 =====
-INDEX_KEY = "QBIT-5"
-TICKERS   = ["IONQ", "QBTS", "RGTI", "ARQQ", "QUBT"]
-BASE_DATE = "2024-01-02"  # 長期系の基準は参照値として残しておく
-
-# ===== ツール =====
 JST = timezone(timedelta(hours=9))
-ET  = timezone(timedelta(hours=-5))  # 米国東部（ざっくり）※夏時間ズレは実用上このままでOK
+ET = timezone(timedelta(hours=-5))  # ※米国夏時間でも yfinance Index がUTCのため日付判定は後段で安全にやる
 
-def now_jst_str():
-    return datetime.now(JST).strftime("%Y/%m/%d %H:%M (JST)")
+# === 設定 ===
+OUTPUT_DIR = "docs/outputs"
+INTRADAY_CSV = os.path.join(OUTPUT_DIR, "qbit_5_intraday.csv")
+LEVELS_CSV = os.path.join(OUTPUT_DIR, "qbit_5_levels.csv")
+STATS_JSON = os.path.join(OUTPUT_DIR, "qbit_5_stats.json")
 
-def today_et_window():
-    """米国当日00:00～翌日00:00(ET)でフィルタするためのUTC時間帯を返す。"""
-    now_et = datetime.now(ET)
-    start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-    end   = start + timedelta(days=1)
-    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+TICKERS = ["IONQ", "QBTS", "RGTI", "ARQQ", "QUBT"]
 
-def _download_intraday(tickers):
-    """
-    できるだけ細かい足を取る（1分がダメなら5分）。
-    yfinanceは複数銘柄同時DL → 'Adj Close' wide表 を返す。
-    """
-    for interval in ("1m", "5m"):
-        try:
-            df = yf.download(
-                tickers=" ".join(tickers),
-                period="5d",           # 当日分は必ず含まれるように広め
-                interval=interval,
-                auto_adjust=False,
-                progress=False,
-                threads=True,
-            )
-            if isinstance(df, pd.DataFrame) and "Adj Close" in df.columns:
-                return df["Adj Close"].copy(), interval
-        except Exception:
-            pass
-    raise RuntimeError("yfinance: intraday download failed")
+# 最低限「当日データがある」とみなすサンプル数（1分足）
+MIN_SAMPLES_TODAY = 30  # 30分ぶん
 
-def build_intraday_series():
-    # 取得
-    wide, interval = _download_intraday(TICKERS)  # index=UTC Timestamp, columns=tickers
-    wide = wide.dropna(how="all")
-    if wide.empty:
-        raise RuntimeError("no price rows")
 
-    # 当日(ET)だけに限定
-    start_utc, end_utc = today_et_window()
-    mask = (wide.index >= start_utc) & (wide.index < end_utc)
-    wide = wide.loc[mask].dropna(how="all")
-    if wide.empty:
-        raise RuntimeError("no prices for today (ET)")
+def _ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
 
-    # 各銘柄の「当日最初の有効値」で正規化
-    norm = pd.DataFrame(index=wide.index)
-    opens = {}
-    for t in TICKERS:
-        s = wide[t].dropna()
-        if s.empty:
+
+def _now_jst_str():
+    return datetime.now(JST).strftime("%Y/%m/%d %H:%M")
+
+
+def _download_1m_last_days(tickers, days=5):
+    frames = []
+    for t in tickers:
+        # period=5d, interval=1m を推奨。auto_adjust=True で分割調整後の価格を取得
+        df = yf.download(
+            t, period=f"{days}d", interval="1m",
+            auto_adjust=True, prepost=False, progress=False, threads=False
+        )
+        if df is None or df.empty:
             continue
-        open_px = s.iloc[0]
-        opens[t] = float(open_px)
-        norm[t] = s / open_px  # 始値=1.0 基準
+        # yfinanceはUTC index。Localize → ETに変換して日付判定に使う
+        if df.index.tz is None:
+            df.index = df.index.tz_localize(timezone.utc)
+        df_et = df.copy()
+        df_et.index = df_et.index.tz_convert(ET)
+        df_et["DateET"] = df_et.index.date
+        df_et["Ticker"] = t
+        frames.append(df_et[["Close", "DateET", "Ticker"]])
 
-    if norm.shape[1] == 0:
-        raise RuntimeError("no usable series after normalization")
+        # API叩き過ぎ防止
+        time.sleep(0.2)
 
-    # 等加重平均＝指数（始値=1.0）
-    idx_norm = norm.mean(axis=1)
+    if not frames:
+        return pd.DataFrame()
 
-    # ％化（Change vs Open）
-    chg_open_pct = (idx_norm - 1.0) * 100.0
+    return pd.concat(frames, axis=0).sort_index()
 
-    # 便利に1行で使えるテーブル
-    out = pd.DataFrame({
-        "level": idx_norm * 100.0,        # 任意のレベル。100=始値
-        "chg_open_pct": chg_open_pct
-    }, index=idx_norm.index)
 
-    return out, interval
+def _select_latest_trading_date(df_all: pd.DataFrame) -> pd.DataFrame:
+    """
+    直近の取引日（ET）のうち、サンプル数が MIN_SAMPLES_TODAY 以上の最新日を返す。
+    見つからなければ空の DataFrame。
+    """
+    if df_all.empty:
+        return df_all
 
-def save_outputs(df_today: pd.DataFrame):
-    # 中間CSV（サイト/デバッグ用）
-    csv_path = os.path.join(OUTD, "qbit_5_levels.csv")
-    tmp = df_today.copy()
-    tmp.index = tmp.index.tz_convert(JST)  # 表示上JSTにしておく
-    tmp.index.name = "datetime_jst"
-    tmp.to_csv(csv_path, float_format="%.6f")
+    # 取引日ごとにサンプル数を計算
+    counts = df_all.groupby("DateET").size().sort_index()
+    # サンプルが十分な日だけ残す
+    valid_days = [d for d, c in counts.items() if c >= MIN_SAMPLES_TODAY]
+    if not valid_days:
+        return pd.DataFrame()
 
-    last_pct = float(tmp["chg_open_pct"].iloc[-1])
+    latest_day = valid_days[-1]
+    return df_all[df_all["DateET"] == latest_day].copy()
 
-    # stats.json（サイトが読む想定のフィールドに寄せる）
-    stats = {
-        "key": INDEX_KEY,
-        "pct_intraday": round(last_pct, 2),    # ←チャート最終点と一致
-        "updated_at": datetime.now(JST).strftime("%Y/%m/%d %H:%M"),
-        "unit": "pct",
-        "last_level": round(float(tmp["level"].iloc[-1]), 2),
-        "base_date": BASE_DATE,
-        "tickers": TICKERS,
-    }
-    with open(os.path.join(OUTD, "qbit_5_stats.json"), "w", encoding="utf-8") as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
 
-    # X投稿テキスト（1行）
-    sign = "+" if last_pct >= 0 else ""
-    with open(os.path.join(OUTD, "qbit_5_post_intraday.txt"), "w", encoding="utf-8") as f:
-        f.write(f"QBIT-5 {sign}{last_pct:.2f}% ({datetime.now(JST).strftime('%Y/%m/%d %H:%M')})\n")
+def _make_equal_weight_intraday(df_day: pd.DataFrame) -> pd.DataFrame:
+    """
+    当日1分足（複数ティッカー）の DataFrame から
+    等加重のインデックス「始値比（%）」の時系列を作る。
+    """
+    if df_day.empty:
+        return df_day
 
-    # 心拍
-    with open(os.path.join(OUTD, "last_run.txt"), "w") as f:
-        f.write(datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S"))
+    out = []
+    # 同一 Timestamp（UTCだがET日付で揃っている）の各ティッカー終値をピボット
+    pivot = df_day.pivot_table(
+        index=df_day.index, columns="Ticker", values="Close", aggfunc="last"
+    ).sort_index()
+
+    # 各ティッカーの「当日オープン（最初のレコード）」で正規化 → 等加重平均
+    open_vals = pivot.ffill().bfill().iloc[0]
+    rel = pivot.div(open_vals) - 1.0  # ratio-1
+    eq = rel.mean(axis=1) * 100.0     # %へ
+
+    s = pd.Series(eq, name="pct_vs_open")
+    s.index.name = "timestamp_utc"
+    return s.to_frame()
+
+
+def _load_last_level() -> float | None:
+    if not os.path.exists(LEVELS_CSV):
+        return None
+    try:
+        df = pd.read_csv(LEVELS_CSV)
+        # level/close など列名のゆらぎを吸収
+        for col in ["level", "Level", "close", "Close", "index_level"]:
+            if col in df.columns:
+                val = df[col].dropna().iloc[-1]
+                return float(val)
+    except Exception:
+        pass
+    return None
+
 
 def main():
-    df, interval = build_intraday_series()
-    save_outputs(df)
+    _ensure_dir(OUTPUT_DIR)
+
+    # 1) 直近5営業日の1分足を取得（空なら休場/エラー）
+    df_all = _download_1m_last_days(TICKERS, days=5)
+    if df_all.empty:
+        print("no intraday data for last 5 days; market likely closed or API empty")
+        # 休場などは正常終了（チャートは前回のままにする）
+        sys.exit(0)
+
+    # 2) サンプル数のある**最新取引日**を特定（当日が無ければ前日）
+    df_day = _select_latest_trading_date(df_all)
+    if df_day.empty:
+        print("no sufficiently-sampled trading day found; skipping without error")
+        sys.exit(0)
+
+    # 3) 当日インデックスの「始値比(%)」時系列を作成
+    intraday = _make_equal_weight_intraday(df_day)
+    if intraday.empty:
+        print("intraday series empty; skipping without error")
+        sys.exit(0)
+
+    # 4) CSVとして保存（チャート生成スクリプトが読み込む）
+    intraday.to_csv(INTRADAY_CSV, index=True)
+
+    # 5) stats.json を更新（pct_intraday / updated_at / last_level）
+    pct_intraday = float(intraday["pct_vs_open"].iloc[-1])
+    updated_at = _now_jst_str()
+    last_level = _load_last_level()
+
+    stats = {
+        "key": "QBIT-5",
+        "pct_intraday": round(pct_intraday, 2),
+        "updated_at": updated_at,
+        "unit": "pct",
+        "last_level": None if (last_level is None or math.isnan(last_level)) else round(last_level, 2),
+        "tickers": TICKERS,
+    }
+
+    with open(STATS_JSON, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+    # 6) 走行記録
+    with open(os.path.join(OUTPUT_DIR, "last_run.txt"), "w", encoding="utf-8") as f:
+        f.write(f"intraday snapshot OK @ {updated_at}\n")
+
+    print("snapshot done; intraday.csv + stats.json written.")
+
 
 if __name__ == "__main__":
     main()
