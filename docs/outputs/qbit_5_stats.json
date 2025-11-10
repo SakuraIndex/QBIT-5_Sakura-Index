@@ -1,10 +1,9 @@
 {
   "key": "QBIT-5",
-  "pct_intraday": 0.74,
-  "updated_at": "2025/11/10 14:07",
+  "pct_intraday": 5.17,
+  "updated_at": "2025/11/10 14:38",
   "unit": "pct",
   "last_level": 1890.09,
-  "base_date": "2024-01-02",
   "tickers": [
     "IONQ",
     "QBTS",
