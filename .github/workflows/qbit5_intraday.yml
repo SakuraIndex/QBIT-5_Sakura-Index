@@ -1,0 +1,43 @@
+name: QBIT-5 Intraday
+
+on:
+  schedule:
+    - cron: '30 22 * * 1-5'   # 平日 22:30 UTC ≒ 米国引け後（夏冬で多少ズレるのは割り切り）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/requirements.txt
+
+      - name: Calc snapshot & stats
+        run: |
+          python src/qbit5_snapshot.py
+
+      - name: Make intraday chart
+        run: |
+          python scripts/make_intraday_post.py
+
+      - name: Prepare X post text (optional)
+        run: |
+          python scripts/qbit5_pct_post.py
+
+      - name: Commit outputs
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: "docs/outputs/*"
+          message: "chore(qbit5): intraday snapshot"
