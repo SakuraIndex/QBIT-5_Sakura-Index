@@ -2,17 +2,24 @@ name: QBIT-5 Intraday
 
 on:
   schedule:
-    - cron: '30 22 * * 1-5'   # 平日 22:30 UTC ≒ 米国引け後（夏冬で多少ズレるのは割り切り）
+    - cron: '30 22 * * 1-5'   # 平日 22:30 UTC ≒ JST 07:30
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# 同時コミット衝突を回避
+concurrency:
+  group: qbit5-outputs-write
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0         # rebase/pull のために全履歴取得
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -36,8 +43,20 @@ jobs:
         run: |
           python scripts/qbit5_pct_post.py
 
+      # ★ push前にリモートを取り込み（non-fast-forward対策）
+      - name: Sync main (rebase)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          git pull --rebase origin main
+
       - name: Commit outputs
         uses: EndBug/add-and-commit@v9
         with:
           add: "docs/outputs/*"
           message: "chore(qbit5): intraday snapshot"
+          default_author: github_actions
+          pull: '--rebase'        # 念のため二重保険
+          push: true
