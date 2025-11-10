@@ -1,67 +1,135 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Intraday chart for QBIT-5
-- 入力: docs/outputs/qbit_5_levels.csv（snapshotが作成）
-- 出力: docs/outputs/qbit_5_intraday.png
-- 黒ベース / 0%ライン / 最終値の符号で色を変える
+QBIT-5 intraday chart builder (reads docs/outputs/qbit_5_intraday.csv)
+- CSVは snapshot スクリプトが出力（index: timestamp_utc, col: pct_vs_open）
+- 休場/データ薄い場合でもエラーにせず静かに終了
 """
 
 import os
-from datetime import datetime, timezone, timedelta
+import sys
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.ticker import PercentFormatter
+from matplotlib.ticker import FuncFormatter, AutoMinorLocator
 
-ROOT = os.path.dirname(os.path.dirname(__file__))
-CSV  = os.path.join(ROOT, "docs", "outputs", "qbit_5_levels.csv")
-OUT  = os.path.join(ROOT, "docs", "outputs", "qbit_5_intraday.png")
+OUTPUT_DIR = "docs/outputs"
+CSV_PATH   = os.path.join(OUTPUT_DIR, "qbit_5_intraday.csv")
+IMG_PATH   = os.path.join(OUTPUT_DIR, "qbit_5_intraday.png")
 
 JST = timezone(timedelta(hours=9))
 
 def load():
-    df = pd.read_csv(CSV)
-    df["datetime_jst"] = pd.to_datetime(df["datetime_jst"])
-    df = df.set_index("datetime_jst").sort_index()
-    return df
+    if not os.path.exists(CSV_PATH):
+        print("intraday csv not found; skip chart")
+        sys.exit(0)
 
-def style_dark(ax):
-    ax.set_facecolor("#0b1420")
-    ax.figure.set_facecolor("#0b1420")
-    for s in ax.spines.values():
-        s.set_color("#1c2a3a")
-        s.set_linewidth(1.0)
-    ax.tick_params(colors="#9fb6c7", labelsize=9)
-    ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
-    ax.grid(True, color="#1c2a3a", alpha=0.7, linewidth=0.8)
+    # 読み込み（index: timestamp_utc）
+    df = pd.read_csv(CSV_PATH)
+    if "timestamp_utc" in df.columns:
+        dt = pd.to_datetime(df["timestamp_utc"], utc=True)
+        df.index = dt
+        df = df.drop(columns=["timestamp_utc"])
+    else:
+        # 古い形式への後方互換（index列が残ってくるケース）
+        df.index = pd.to_datetime(df.index, utc=True)
 
-def run():
+    # 欠損・重複整理
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")].copy()
+
+    # JSTへ（表示を日本時間に揃える）
+    df.index = df.index.tz_convert(JST)
+
+    # 列名を保証
+    if "pct_vs_open" not in df.columns:
+        # 旧: change_pct などがあれば拾っておく
+        for c in ["change_pct", "pct", "value"]:
+            if c in df.columns:
+                df = df.rename(columns={c: "pct_vs_open"})
+                break
+    if "pct_vs_open" not in df.columns:
+        print("no pct_vs_open column; skip chart")
+        sys.exit(0)
+
+    # データが薄いときは描画スキップ
+    if len(df) < 10:
+        print("intraday points < 10; skip chart")
+        sys.exit(0)
+
+    return df[["pct_vs_open"]].astype(float)
+
+
+def style_dark():
+    plt.rcParams.update({
+        "figure.facecolor": "#0b1420",
+        "axes.facecolor":   "#0b1420",
+        "savefig.facecolor":"#0b1420",
+        "axes.edgecolor":   "#1c2a3a",
+        "axes.labelcolor":  "#cfe6f3",
+        "xtick.color":      "#9fb6c7",
+        "ytick.color":      "#9fb6c7",
+        "grid.color":       "#1f2d3d",
+        "font.size":        12,
+        "axes.titleweight": "bold",
+    })
+
+
+def pct_formatter(x, pos):
+    return f"{x:.1f}%"
+
+
+def main():
+    style_dark()
     df = load()
-    y = df["chg_open_pct"]
-    last = float(y.iloc[-1])
 
-    line = "#29c7c7" if last >= 0 else "#fb7185"
-    fill = line
+    last = float(df["pct_vs_open"].iloc[-1])
+    up_color   = "#10b981"  # 緑
+    down_color = "#fb7185"  # 赤
+    line_color = up_color if last >= 0 else down_color
+    fill_color = line_color
 
-    fig = plt.figure(figsize=(13, 6), dpi=140)
-    ax = fig.add_subplot(111)
-    style_dark(ax)
+    # 滑らかさ向上（3分移動平均）
+    s = df["pct_vs_open"].rolling(3, min_periods=1).mean()
 
-    ax.plot(y.index, y.values, linewidth=2.1, color=line)
-    ax.fill_between(y.index, 0, y.values, alpha=0.08, color=fill)
-    ax.axhline(0.0, color="#1c2a3a", linewidth=1.0)
+    fig = plt.figure(figsize=(15, 8.5), dpi=150)
+    ax  = fig.add_subplot(111)
 
-    ax.set_ylabel("Change vs Open (%)", color="#9fb6c7")
-    ax.set_xlabel("", color="#9fb6c7")
+    # グリッドを細かく
+    ax.grid(True, which="major", linestyle="-", linewidth=0.8, alpha=0.6)
+    ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.35)
+    ax.yaxis.set_minor_locator(AutoMinorLocator())
 
-    ts = datetime.now(JST).strftime("%Y/%m/%d %H:%M (JST)")
-    ax.set_title(f"QBIT-5 Intraday Snapshot ({ts})", color="#cfe6f3", fontsize=12, pad=10)
+    # 0% ライン
+    ax.axhline(0.0, color="#284056", linewidth=1.0)
 
+    # ライン＆面
+    ax.plot(s.index, s.values, linewidth=2.2, color=line_color)
+    ax.fill_between(s.index, s.values, 0, where=None, alpha=0.16, color=fill_color)
+
+    # 軸ラベル
+    ax.set_ylabel("Change vs Open (%)")
+    ax.yaxis.set_major_formatter(FuncFormatter(pct_formatter))
+
+    # 余白
+    ax.margins(x=0.01)
+
+    # タイトル（JST）
+    updated_jst = df.index[-1].astimezone(JST).strftime("%Y/%m/%d %H:%M (JST)")
+    ax.set_title(f"QBIT-5 Intraday Snapshot ({updated_jst})", color="#e6f2fb", pad=14)
+
+    # 上下に少し余裕
+    ypad = max(1.0, (s.max() - s.min()) * 0.1)
+    ax.set_ylim(s.min() - ypad, s.max() + ypad)
+
+    # 保存
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     plt.tight_layout()
-    fig.savefig(OUT, facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.savefig(IMG_PATH, bbox_inches="tight")
     plt.close(fig)
+    print(f"saved {IMG_PATH} (last={last:+.2f}%)")
+
 
 if __name__ == "__main__":
-    run()
+    main()
