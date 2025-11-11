@@ -1,0 +1,20 @@
+{
+  "index_key": "QBIT-5",
+  "label": "QBIT-5",
+  "category": "量子コンピューティング（米国）",
+  "description": "米国上場の量子計算関連企業5社で構成。NISQ時代の実用化に向けた開発・クラウド提供・ソリューション展開に着目。",
+  "method": {
+    "weighting": "equal",
+    "rebalancing": "quarterly",
+    "fx": "USDJPY spot",
+    "calc": "intraday percent vs prev_close",
+    "notes": "為替換算はサイト側で表示時に処理可能。"
+  },
+  "components": [
+    { "ticker": "IONQ", "exchange": "NASDAQ", "name_ja": "イオンキュー", "weight": 0.20 },
+    { "ticker": "QBTS", "exchange": "NYSE",   "name_ja": "Dウェイブ・クアンタム", "weight": 0.20 },
+    { "ticker": "RGTI", "exchange": "NASDAQ", "name_ja": "リゲッティ・コンピューティング", "weight": 0.20 },
+    { "ticker": "ARQQ", "exchange": "NASDAQ", "name_ja": "アーキット・クアンタム", "weight": 0.20 },
+    { "ticker": "QUBT", "exchange": "NASDAQ", "name_ja": "クオンタム・コンピューティング", "weight": 0.20 }
+  ]
+}
